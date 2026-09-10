@@ -1,0 +1,595 @@
+#include <ESP8266WiFi.h>
+#include <EEPROM.h>
+#include <ESP8266WebServer.h>
+#include <DNSServer.h>
+extern "C" {
+#include <espnow.h>
+#include <user_interface.h>
+}
+
+const uint8_t PROTOCOLO = 3;
+const uint8_t MAX_GPIOS = 8;
+const size_t TAM_ROTULO = 12;
+const size_t TAM_CONTROLE = 176;
+const uint8_t RECURSO_INTERVALO = 1;
+const uint8_t RECURSO_COMANDO = 2;
+const uint8_t RECURSO_BROADCAST_LEGADO = 4;
+const uint8_t ANUNCIO = 1;
+const uint8_t ACEITE = 2;
+const uint8_t CONFIG_OK = 3;
+const uint8_t PRESENCA = 4;
+const uint8_t RESPOSTA = 5;
+const uint8_t PREPARAR_CANAL = 6;
+const uint8_t CANAL_OK = 7;
+const uint8_t CONFIGURAR = 8;
+const uint8_t CONFIG_ERRO = 9;
+const uint8_t TROCAR_CANAL = 10;
+const uint8_t BROADCAST[6] = {255, 255, 255, 255, 255, 255};
+
+struct ConfigDispositivo {
+  uint8_t quantidadeGPIOs;
+  uint8_t recursos;
+  uint8_t pinos[MAX_GPIOS];
+  char rotulos[MAX_GPIOS][TAM_ROTULO];
+  uint32_t intervaloMinimo;
+  uint32_t intervaloMaximo;
+  uint32_t intervalo;
+  uint32_t revisao;
+  char nome[33];
+};
+
+struct Pacote {
+  uint8_t origem[6];
+  uint8_t destino[6];
+  uint8_t dados[250];
+  int tamanho;
+};
+
+const int TAM_FILA = 8;
+Pacote fila[TAM_FILA];
+int inicioFila = 0;
+int quantidadeFila = 0;
+uint8_t meuMAC[6];
+bool espNowAtivo = false;
+void envioConcluido(uint8_t* destino, uint8_t status);
+
+bool canalValido(int canal) {
+  return canal >= 1 && canal <= 13;
+}
+
+uint8_t canalAtual() {
+  return wifi_get_channel();
+}
+
+bool macValido(const uint8_t* mac) {
+  uint8_t bits = 0;
+  for (int i = 0; i < 6; i++) bits |= mac[i];
+  return bits != 0 && (mac[0] & 1) == 0;
+}
+
+String textoMAC(const uint8_t* mac) {
+  char texto[18];
+  snprintf(texto, sizeof(texto), "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(texto);
+}
+
+uint32_t ler32(const uint8_t* dados) {
+  return uint32_t(dados[0]) | (uint32_t(dados[1]) << 8) |
+    (uint32_t(dados[2]) << 16) | (uint32_t(dados[3]) << 24);
+}
+
+void gravar32(uint8_t* dados, uint32_t valor) {
+  for (int i = 0; i < 4; i++) dados[i] = (valor >> (8 * i)) & 255;
+}
+
+bool descricaoValida(const ConfigDispositivo& c) {
+  if (c.quantidadeGPIOs > MAX_GPIOS || (c.recursos & ~(RECURSO_INTERVALO | RECURSO_COMANDO | RECURSO_BROADCAST_LEGADO)) != 0) return false;
+  for (int i = 0; i < MAX_GPIOS; i++) {
+    if (c.rotulos[i][TAM_ROTULO - 1] != 0) return false;
+    if (i < c.quantidadeGPIOs) {
+      if (c.rotulos[i][0] == 0) return false;
+    } else if (c.rotulos[i][0] != 0) return false;
+  }
+  if (c.recursos & RECURSO_INTERVALO) {
+    return c.intervaloMinimo >= 1 && c.intervaloMaximo >= c.intervaloMinimo && c.intervaloMaximo <= 86400;
+  }
+  return c.intervaloMinimo == 0 && c.intervaloMaximo == 0;
+}
+
+bool configuracaoValida(const ConfigDispositivo& c) {
+  if (!descricaoValida(c) || c.nome[0] == 0 || c.nome[32] != 0 || c.revisao == 0) return false;
+  for (int i = 0; i < MAX_GPIOS; i++) {
+    if (i < c.quantidadeGPIOs) {
+      if (c.pinos[i] == 255) return false;
+      for (int j = 0; j < i; j++) if (c.pinos[i] == c.pinos[j]) return false;
+    } else if (c.pinos[i] != 255) return false;
+  }
+  if (c.recursos & RECURSO_INTERVALO) return c.intervalo >= c.intervaloMinimo && c.intervalo <= c.intervaloMaximo;
+  return c.intervalo == 0;
+}
+
+ConfigDispositivo lerConfiguracao(const uint8_t* dados) {
+  ConfigDispositivo c = {};
+  c.quantidadeGPIOs = dados[6];
+  c.recursos = dados[26];
+  c.revisao = ler32(dados + 18);
+  c.intervalo = ler32(dados + 22);
+  memcpy(c.nome, dados + 28, 33);
+  memcpy(c.pinos, dados + 61, MAX_GPIOS);
+  memcpy(c.rotulos, dados + 69, MAX_GPIOS * TAM_ROTULO);
+  c.intervaloMinimo = ler32(dados + 165);
+  c.intervaloMaximo = ler32(dados + 169);
+  return c;
+}
+
+bool mesmaDescricao(const ConfigDispositivo& a, const ConfigDispositivo& b) {
+  if (a.quantidadeGPIOs != b.quantidadeGPIOs || a.recursos != b.recursos ||
+      a.intervaloMinimo != b.intervaloMinimo || a.intervaloMaximo != b.intervaloMaximo) return false;
+  for (int i = 0; i < MAX_GPIOS; i++) if (strcmp(a.rotulos[i], b.rotulos[i]) != 0) return false;
+  return true;
+}
+
+bool mesmaConfiguracao(const ConfigDispositivo& a, const ConfigDispositivo& b) {
+  return mesmaDescricao(a, b) && memcmp(a.pinos, b.pinos, MAX_GPIOS) == 0 &&
+    a.intervalo == b.intervalo && a.revisao == b.revisao && strcmp(a.nome, b.nome) == 0;
+}
+
+void montarControle(uint8_t* dados, uint8_t tipo, const uint8_t* sensor,
+                    uint32_t sessao, const ConfigDispositivo& c, uint8_t canal, uint32_t transacao) {
+  memset(dados, 0, TAM_CONTROLE);
+  memcpy(dados, "NWAY", 4);
+  dados[4] = PROTOCOLO;
+  dados[5] = tipo;
+  dados[6] = c.quantidadeGPIOs;
+  dados[7] = canal;
+  memcpy(dados + 8, sensor, 6);
+  gravar32(dados + 14, sessao);
+  gravar32(dados + 18, transacao);
+  gravar32(dados + 22, c.intervalo);
+  dados[26] = c.recursos;
+  memcpy(dados + 28, c.nome, 33);
+  memcpy(dados + 61, c.pinos, MAX_GPIOS);
+  memcpy(dados + 69, c.rotulos, MAX_GPIOS * TAM_ROTULO);
+  gravar32(dados + 165, c.intervaloMinimo);
+  gravar32(dados + 169, c.intervaloMaximo);
+}
+
+bool controleValido(const Pacote& p) {
+  return p.tamanho == int(TAM_CONTROLE) && memcmp(p.dados, "NWAY", 4) == 0 &&
+    p.dados[4] == PROTOCOLO && p.dados[5] >= ANUNCIO && p.dados[5] <= TROCAR_CANAL &&
+    canalValido(p.dados[7]) && p.dados[27] == 0 && p.dados[60] == 0 &&
+    p.dados[173] == 0 && p.dados[174] == 0 && p.dados[175] == 0 &&
+    macValido(p.origem) && memcmp(p.origem, meuMAC, 6) != 0 &&
+    descricaoValida(lerConfiguracao(p.dados));
+}
+
+bool adicionarPeer(const uint8_t* mac) {
+  if (esp_now_is_peer_exist(const_cast<uint8_t*>(mac))) return true;
+  return esp_now_add_peer(const_cast<uint8_t*>(mac), ESP_NOW_ROLE_COMBO, 0, nullptr, 0) == 0;
+}
+
+bool enviarBytes(const uint8_t* destino, const uint8_t* dados, size_t tamanho) {
+  if (!espNowAtivo || destino == nullptr || dados == nullptr || tamanho == 0 || tamanho > 250) return false;
+  if (!adicionarPeer(destino)) return false;
+  return esp_now_send(const_cast<uint8_t*>(destino), const_cast<uint8_t*>(dados), static_cast<uint8_t>(tamanho)) == 0;
+}
+
+void receberESPNow(uint8_t* origem, uint8_t* dados, uint8_t tamanho) {
+  if (origem == nullptr || dados == nullptr || tamanho == 0 || tamanho > 250) return;
+  noInterrupts();
+  if (quantidadeFila < TAM_FILA) {
+    int i = (inicioFila + quantidadeFila) % TAM_FILA;
+    memcpy(fila[i].origem, origem, 6);
+    memcpy(fila[i].destino, meuMAC, 6);
+    memcpy(fila[i].dados, dados, tamanho);
+    fila[i].tamanho = tamanho;
+    quantidadeFila++;
+  }
+  interrupts();
+}
+
+bool retirarPacote(Pacote& p) {
+  bool encontrado = false;
+  noInterrupts();
+  if (quantidadeFila > 0) {
+    p = fila[inicioFila];
+    inicioFila = (inicioFila + 1) % TAM_FILA;
+    quantidadeFila--;
+    encontrado = true;
+  }
+  interrupts();
+  return encontrado;
+}
+
+void iniciarESPNow() {
+  if (esp_now_init() != 0) return;
+  esp_now_set_self_role(ESP_NOW_ROLE_COMBO);
+  esp_now_register_recv_cb(receberESPNow);
+  esp_now_register_send_cb(envioConcluido);
+  espNowAtivo = true;
+}
+
+ConfigDispositivo configuracao = {};
+uint8_t receptorMAC[6] = {};
+uint32_t sessao = 0;
+bool pareado = false;
+bool ligadoAoReceptor = false;
+bool enviarInicial = true;
+uint8_t canalSalvo = 1;
+uint8_t canalBusca = 1;
+uint32_t ultimoContato = 0;
+uint32_t ultimoControle = 0;
+uint32_t ultimoPasso = 0;
+uint32_t transacaoCanal = 0;
+uint32_t inicioPreparacao = 0;
+uint32_t inicioTroca = 0;
+uint8_t canalPlanejado = 1;
+bool trocaArmada = false;
+ESP8266WebServer servidorRecuperacao(80);
+DNSServer dnsRecuperacao;
+bool apRecuperacao = false;
+
+const uint8_t PIN_RELE = 12;
+const uint8_t PIN_BOTAO = 0;
+const uint8_t PIN_LED = 13;
+bool estadoRele = false;
+bool leituraBotao = HIGH;
+bool estadoBotao = HIGH;
+uint32_t instanteMudancaBotao = 0;
+bool estadoPendente = false;
+uint32_t instanteEstadoPendente = 0;
+volatile bool envioEstadoEmCurso = false;
+volatile bool estadoEntregue = false;
+
+void envioConcluido(uint8_t* destino, uint8_t status) {
+  if (!pareado || destino == nullptr) return;
+  if (envioEstadoEmCurso && memcmp(destino, BROADCAST, 6) == 0) {
+    estadoEntregue = status == 0;
+    envioEstadoEmCurso = false;
+  }
+}
+
+ConfigDispositivo padraoDispositivo() {
+  ConfigDispositivo c = {};
+  c.quantidadeGPIOs = 0;
+  c.revisao = 1;
+  c.recursos = RECURSO_COMANDO | RECURSO_BROADCAST_LEGADO;
+  strncpy(c.nome, textoMAC(meuMAC).c_str(), sizeof(c.nome) - 1);
+  for (uint8_t i = 0; i < MAX_GPIOS; i++) c.pinos[i] = 255;
+  return c;
+}
+
+bool configuracaoLocalValida(const ConfigDispositivo& c) {
+  return configuracaoValida(c) && mesmaDescricao(c, configuracao);
+}
+
+bool salvarRegistro(const ConfigDispositivo& c, const uint8_t* receptor, uint8_t canal) {
+  uint8_t registro[TAM_CONTROLE + 6] = {};
+  montarControle(registro, CONFIG_OK, meuMAC, 0, c, canal, c.revisao);
+  memcpy(registro + TAM_CONTROLE, receptor, 6);
+  EEPROM.begin(256);
+  for (size_t i = 0; i < sizeof(registro); i++) EEPROM.write(i, registro[i]);
+  bool salvo = EEPROM.commit();
+  if (salvo) {
+    for (size_t i = 0; i < sizeof(registro); i++) {
+      if (EEPROM.read(i) != registro[i]) {
+        salvo = false;
+        break;
+      }
+    }
+  }
+  EEPROM.end();
+  return salvo;
+}
+
+void carregarConfiguracao() {
+  configuracao = padraoDispositivo();
+  EEPROM.begin(256);
+  uint8_t registro[TAM_CONTROLE + 6] = {};
+  for (size_t i = 0; i < sizeof(registro); i++) registro[i] = EEPROM.read(i);
+  EEPROM.end();
+  if (memcmp(registro, "NWAY", 4) == 0 && registro[4] == PROTOCOLO &&
+      canalValido(registro[7]) && macValido(registro + TAM_CONTROLE)) {
+    ConfigDispositivo salva = lerConfiguracao(registro);
+    if (configuracaoLocalValida(salva)) {
+      configuracao = salva;
+      memcpy(receptorMAC, registro + TAM_CONTROLE, 6);
+      canalSalvo = registro[7];
+      pareado = true;
+    }
+  }
+}
+
+void enviarControle(uint8_t tipo, uint8_t canal, uint32_t transacao, const uint8_t* destino) {
+  uint8_t dados[TAM_CONTROLE];
+  montarControle(dados, tipo, meuMAC, sessao, configuracao, canal, transacao);
+  enviarBytes(BROADCAST, dados, sizeof(dados));
+}
+
+void agendarEstado() {
+  estadoPendente = true;
+  instanteEstadoPendente = millis();
+  envioEstadoEmCurso = false;
+  estadoEntregue = false;
+}
+
+void atenderEstadoPendente() {
+  if (!estadoPendente) return;
+  if (estadoEntregue) {
+    estadoPendente = false;
+    estadoEntregue = false;
+    return;
+  }
+  if (envioEstadoEmCurso || millis() - instanteEstadoPendente < 100) return;
+  if (!pareado || !ligadoAoReceptor) return;
+  String valor = estadoRele ? "\"ON\"" : "\"OFF\"";
+  String mensagem = "{\"" + textoMAC(meuMAC) + "\":" + valor + "}";
+  envioEstadoEmCurso = true;
+  instanteEstadoPendente = millis();
+  if (!enviarBytes(BROADCAST, (const uint8_t*)mensagem.c_str(), mensagem.length())) envioEstadoEmCurso = false;
+}
+
+void iniciarHardware() {
+  digitalWrite(PIN_RELE, LOW);
+  pinMode(PIN_RELE, OUTPUT);
+  digitalWrite(PIN_LED, HIGH);
+  pinMode(PIN_LED, OUTPUT);
+  pinMode(PIN_BOTAO, INPUT_PULLUP);
+  leituraBotao = digitalRead(PIN_BOTAO);
+  estadoBotao = leituraBotao;
+  instanteMudancaBotao = millis();
+}
+
+
+void atenderHardware() {
+  bool leitura = digitalRead(PIN_BOTAO);
+  if (leitura != leituraBotao) {
+    leituraBotao = leitura;
+    instanteMudancaBotao = millis();
+  }
+  if (leitura != estadoBotao && millis() - instanteMudancaBotao >= 40) {
+    bool anterior = estadoBotao;
+    estadoBotao = leitura;
+    if (anterior == HIGH && estadoBotao == LOW) {
+      estadoRele = !estadoRele;
+      digitalWrite(PIN_RELE, estadoRele ? HIGH : LOW);
+      digitalWrite(PIN_LED, estadoRele ? LOW : HIGH);
+      if (pareado && sessao != 0) agendarEstado();
+    }
+  }
+}
+
+void confirmarContato() {
+  if (!ligadoAoReceptor) enviarInicial = true;
+  ligadoAoReceptor = true;
+  ultimoContato = millis();
+  canalBusca = canalAtual();
+  if (canalSalvo != canalAtual()) {
+    if (salvarRegistro(configuracao, receptorMAC, canalAtual())) canalSalvo = canalAtual();
+  }
+}
+
+void processarPacote(const Pacote& p) {
+  if (pareado && p.tamanho >= 11 && memcmp(p.origem, receptorMAC, 6) == 0 &&
+      memcmp(p.dados, "NWBC", 4) == 0 && memcmp(p.dados + 4, meuMAC, 6) == 0) {
+    size_t tamanho = p.tamanho - 10;
+    const uint8_t* comando = p.dados + 10;
+    if ((tamanho == 2 && memcmp(comando, "ON", 2) == 0) ||
+        (tamanho == 3 && memcmp(comando, "OFF", 3) == 0)) {
+      confirmarContato();
+      estadoRele = tamanho == 2;
+      digitalWrite(PIN_RELE, estadoRele ? HIGH : LOW);
+      digitalWrite(PIN_LED, estadoRele ? LOW : HIGH);
+      agendarEstado();
+      enviarInicial = false;
+      return;
+    }
+  }
+  if (pareado && memcmp(p.origem, receptorMAC, 6) == 0 &&
+      memcmp(p.destino, meuMAC, 6) == 0) {
+    if ((p.tamanho == 2 && memcmp(p.dados, "ON", 2) == 0) ||
+        (p.tamanho == 3 && memcmp(p.dados, "OFF", 3) == 0)) {
+      confirmarContato();
+      estadoRele = p.tamanho == 2;
+      digitalWrite(PIN_RELE, estadoRele ? HIGH : LOW);
+      digitalWrite(PIN_LED, estadoRele ? LOW : HIGH);
+      agendarEstado();
+      enviarInicial = false;
+      return;
+    }
+  }
+  if (!controleValido(p) ||
+      memcmp(p.destino, meuMAC, 6) != 0 || memcmp(p.dados + 8, meuMAC, 6) != 0 ||
+      ler32(p.dados + 14) != sessao) return;
+  uint8_t tipo = p.dados[5];
+  if (pareado && memcmp(p.origem, receptorMAC, 6) != 0) return;
+  if (!pareado && tipo != ACEITE) return;
+  if (tipo == ACEITE || tipo == CONFIGURAR) {
+    ConfigDispositivo nova = lerConfiguracao(p.dados);
+    if (pareado && int32_t(nova.revisao - configuracao.revisao) < 0) {
+      enviarControle(CONFIG_OK, canalAtual(), configuracao.revisao, receptorMAC);
+      return;
+    }
+    if (!configuracaoLocalValida(nova)) {
+      enviarControle(CONFIG_ERRO, canalAtual(), nova.revisao, p.origem);
+      return;
+    }
+    bool mudou = !pareado || !mesmaConfiguracao(configuracao, nova);
+    if (mudou && !salvarRegistro(nova, p.origem, canalAtual())) {
+      enviarControle(CONFIG_ERRO, canalAtual(), nova.revisao, p.origem);
+      return;
+    }
+    configuracao = nova;
+    memcpy(receptorMAC, p.origem, 6);
+    pareado = true;
+    if (mudou) {
+      canalSalvo = canalAtual();
+      enviarInicial = true;
+    }
+    confirmarContato();
+    enviarControle(CONFIG_OK, canalAtual(), configuracao.revisao, receptorMAC);
+  } else if (tipo == RESPOSTA) {
+    confirmarContato();
+  } else if (tipo == PREPARAR_CANAL) {
+    uint32_t id = ler32(p.dados + 18);
+    if (id == 0) return;
+    if (id != transacaoCanal) trocaArmada = false;
+    transacaoCanal = id;
+    canalPlanejado = p.dados[7];
+    inicioPreparacao = millis();
+    enviarControle(CANAL_OK, canalPlanejado, id, receptorMAC);
+  } else if (tipo == TROCAR_CANAL && ler32(p.dados + 18) == transacaoCanal &&
+             transacaoCanal != 0 && p.dados[7] == canalPlanejado && !trocaArmada) {
+    trocaArmada = true;
+    inicioTroca = millis();
+  }
+}
+
+void atenderRadio() {
+  Pacote p;
+  for (int i = 0; i < TAM_FILA && retirarPacote(p); i++) processarPacote(p);
+  uint32_t agora = millis();
+  if (trocaArmada && agora - inicioTroca >= 2000) {
+    if (wifi_set_channel(canalPlanejado)) {
+      ligadoAoReceptor = false;
+      ultimoContato = agora;
+      ultimoPasso = agora;
+      ultimoControle = agora - 3000;
+    }
+    trocaArmada = false;
+    transacaoCanal = 0;
+  }
+  if (!trocaArmada && transacaoCanal != 0 && agora - inicioPreparacao > 15000) transacaoCanal = 0;
+  bool procurando = !pareado || agora - ultimoContato > 12000;
+  if (procurando) {
+    ligadoAoReceptor = false;
+    if (agora - ultimoPasso >= 1500) {
+      for (int tentativa = 0; tentativa < 13; tentativa++) {
+        canalBusca = canalBusca % 13 + 1;
+        if (wifi_set_channel(canalBusca)) break;
+      }
+      ultimoPasso = agora;
+      ultimoControle = agora - 3000;
+    }
+  }
+  uint32_t periodo = procurando ? 600 : 3000;
+  if (agora - ultimoControle >= periodo) {
+    ultimoControle = agora;
+    enviarControle(pareado ? PRESENCA : ANUNCIO, canalAtual(), configuracao.revisao,
+                   pareado ? receptorMAC : BROADCAST);
+  }
+}
+
+
+String paginaRecuperacao() {
+  return "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>RESET</title><style>body{margin:0;background:#F2EAD8;color:#171512;font:16px ui-monospace,Consolas,'Courier New',monospace;padding:20px}.card{max-width:520px;margin:40px auto;padding:20px;border:1px solid #171512}button{width:100%;padding:12px;background:#F2EAD8;color:#171512;border:3px double #171512;font:inherit;font-size:18px;font-weight:bold}</style></head><body><main class='card'><h1>" + String(configuracao.nome) + "</h1><p>Hub não encontrado.</p><form action='/reset' method='post'><button type='submit'>RESET</button></form></main></body></html>";
+}
+
+void executarResetWeb() {
+  EEPROM.begin(256);
+  for (size_t i = 0; i < 256; i++) EEPROM.write(i, 0xFF);
+  bool limpo = EEPROM.commit();
+  if (limpo) {
+    for (size_t i = 0; i < 256; i++) {
+      if (EEPROM.read(i) != 0xFF) {
+        limpo = false;
+        break;
+      }
+    }
+  }
+  EEPROM.end();
+  if (!limpo) {
+    servidorRecuperacao.send(500, "text/html; charset=utf-8", paginaRecuperacao());
+    return;
+  }
+  servidorRecuperacao.send(200, "text/html; charset=utf-8", "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Reiniciando</title><style>body{margin:0;background:#F2EAD8;color:#171512;font:16px ui-monospace,Consolas,'Courier New',monospace;padding:20px}.card{max-width:520px;margin:40px auto;padding:20px;border:1px solid #171512}</style></head><body><main class='card'><h1>Reiniciando</h1></main></body></html>");
+  delay(300);
+  ESP.restart();
+}
+
+void iniciarAPRecuperacao() {
+  if (apRecuperacao || !pareado) return;
+  if (espNowAtivo) {
+    esp_now_deinit();
+    espNowAtivo = false;
+  }
+  WiFi.disconnect(false, false);
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
+  IPAddress ip(192, 168, 4, 1);
+  IPAddress mascara(255, 255, 255, 0);
+  if (!WiFi.softAPConfig(ip, ip, mascara)) {
+    delay(500);
+    ESP.restart();
+    return;
+  }
+  servidorRecuperacao.on("/", HTTP_GET, []() {
+    servidorRecuperacao.send(200, "text/html; charset=utf-8", paginaRecuperacao());
+  });
+  servidorRecuperacao.on("/reset", HTTP_POST, executarResetWeb);
+  servidorRecuperacao.onNotFound([]() {
+    servidorRecuperacao.sendHeader("Location", "http://192.168.4.1/", true);
+    servidorRecuperacao.send(302, "text/plain", "");
+  });
+  servidorRecuperacao.begin();
+  if (!WiFi.softAP(configuracao.nome, nullptr, canalAtual(), false, 4)) {
+    servidorRecuperacao.stop();
+    delay(500);
+    ESP.restart();
+    return;
+  }
+  dnsRecuperacao.setErrorReplyCode(DNSReplyCode::NoError);
+  if (!dnsRecuperacao.start(53, "*", ip)) {
+    WiFi.softAPdisconnect(true);
+    servidorRecuperacao.stop();
+    delay(500);
+    ESP.restart();
+    return;
+  }
+  apRecuperacao = true;
+}
+
+void setup() {
+  wifi_get_macaddr(STATION_IF, meuMAC);
+  if (!macValido(meuMAC)) {
+    memset(meuMAC, 0, sizeof(meuMAC));
+    return;
+  }
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(false);
+  WiFi.disconnect(false, false);
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
+  carregarConfiguracao();
+  wifi_set_channel(canalSalvo);
+  canalBusca = canalSalvo;
+  sessao = os_random();
+  if (sessao == 0) sessao = 1;
+  iniciarHardware();
+  iniciarESPNow();
+  ultimoContato = millis();
+  ultimoPasso = millis();
+  ultimoControle = millis() - 3000;
+}
+
+void loop() {
+  if (!macValido(meuMAC)) {
+    delay(100);
+    return;
+  }
+  if (apRecuperacao) {
+    dnsRecuperacao.processNextRequest();
+    servidorRecuperacao.handleClient();
+    delay(2);
+    return;
+  }
+  if (pareado && millis() - ultimoContato >= 60000) {
+    iniciarAPRecuperacao();
+    return;
+  }
+  if (espNowAtivo) atenderRadio();
+  atenderEstadoPendente();
+  atenderHardware();
+  delay(5);
+}
+
+

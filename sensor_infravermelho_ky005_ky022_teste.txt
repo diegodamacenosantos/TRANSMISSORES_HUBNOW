@@ -1,0 +1,199 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Preferences.h>
+#include <esp_mac.h>
+#include <esp_wifi.h>
+#include <driver/gpio.h>
+#define RAW_BUFFER_LENGTH 300
+#define SEND_PWM_BY_TIMER
+#define NO_LED_FEEDBACK_CODE
+#include <IRremote.hpp>
+
+WebServer servidor(80);
+DNSServer dns;
+const size_t MAX_TEMPOS = RAW_BUFFER_LENGTH - 1;
+uint16_t esperado[MAX_TEMPOS];
+int32_t recebido[MAX_TEMPOS];
+size_t quantidadeEsperada = 0;
+uint8_t gpioRX = 4;
+uint8_t gpioTX = 5;
+bool ocupado = false;
+bool iniciado = false;
+bool emitir = false;
+bool pronto = false;
+uint32_t inicio = 0;
+String resultado = "Escolha uma posicao gravada e um teste.";
+String nomeAP;
+
+bool numero(const String& texto, int minimo, int maximo, int& valor) {
+  if (texto.length() == 0 || texto.length() > 3) return false;
+  valor = 0;
+  for (size_t i = 0; i < texto.length(); i++) {
+    if (texto[i] < '0' || texto[i] > '9') return false;
+    valor = valor * 10 + texto[i] - '0';
+  }
+  return valor >= minimo && valor <= maximo;
+}
+
+bool carregar(int posicao) {
+  quantidadeEsperada = 0;
+  Preferences memoria;
+  if (!memoria.begin("neway", true)) return false;
+  char chave[8];
+  snprintf(chave, sizeof(chave), "ir%u", unsigned(posicao));
+  size_t tamanho = memoria.getBytesLength(chave);
+  bool ok = tamanho >= 6 && tamanho <= sizeof(esperado) && tamanho % 2 == 0;
+  if (ok) ok = memoria.getBytes(chave, esperado, tamanho) == tamanho;
+  memoria.end();
+  if (!ok) return false;
+  quantidadeEsperada = tamanho / sizeof(uint16_t);
+  uint32_t total = 0;
+  for (size_t i = 0; i < quantidadeEsperada; i++) {
+    if (esperado[i] == 0) return false;
+    total += esperado[i];
+  }
+  return total <= 2000000;
+}
+
+String pagina() {
+  String html = "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>";
+  html += nomeAP;
+  html += " | Diagnostico IR</title><style>body{background:#F2EAD8;color:#171512;font:16px ui-monospace,Consolas,'Courier New',monospace;margin:20px}.card{padding:20px;max-width:700px;margin:auto;border:1px solid #171512}input,button,textarea{box-sizing:border-box;background:#F2EAD8;color:#171512;border:1px solid #171512;padding:10px;margin:6px 0;width:100%;font:inherit}button{font-weight:bold}input[type=number]{appearance:textfield;-moz-appearance:textfield}input[type=number]::-webkit-inner-spin-button,input[type=number]::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}textarea{height:320px}</style></head><body><main class='card'><h1>Diagnostico IR</h1><p>Somente leitura da memoria. Sem ESP-NOW ou MQTT.</p><form method='post' action='/teste'><label>GPIO RX</label><input name='rx' type='number' min='0' max='";
+  html += String(GPIO_NUM_MAX - 1);
+  html += "' value='" + String(gpioRX) + "' required><label>GPIO TX</label><input name='tx' type='number' min='0' max='";
+  html += String(GPIO_NUM_MAX - 1);
+  html += "' value='" + String(gpioTX) + "' required><label>Posicao gravada</label><input name='posicao' type='number' min='1' max='16' value='1' required><button name='modo' value='emitir'>Emitir e comparar</button><button name='modo' value='ouvir'>Ouvir controle original (10 s)</button></form><p>Para comparar a emissao, aponte o emissor para o receptor sem encostar. Nao aperte outro controle durante esse teste.</p><textarea id='resultado' readonly></textarea><p>Comparacao aproximada dos pulsos: nao mede portadora, corrente ou potencia optica. Recepcao simultanea pode influenciar os tempos.</p></main><script>async function estado(){try{const r=await fetch('/estado',{cache:'no-store'});if(!r.ok)throw Error();const t=await r.text();document.getElementById('resultado').value=t.slice(2);if(t.startsWith('1'))setTimeout(estado,500);}catch(e){setTimeout(estado,1000);}}estado();</script></body></html>";
+  return html;
+}
+
+void testar() {
+  if (ocupado) {
+    servidor.send(409, "text/plain", "Teste em andamento.");
+    return;
+  }
+  int rx, tx, posicao;
+  String modo = servidor.arg("modo");
+  if (!numero(servidor.arg("rx"), 0, GPIO_NUM_MAX - 1, rx) ||
+      !numero(servidor.arg("tx"), 0, GPIO_NUM_MAX - 1, tx) ||
+      !numero(servidor.arg("posicao"), 1, 16, posicao) ||
+      rx == tx || !GPIO_IS_VALID_GPIO(rx) || !GPIO_IS_VALID_OUTPUT_GPIO(tx) ||
+      (modo != "emitir" && modo != "ouvir")) {
+    servidor.send(400, "text/plain", "Parametros invalidos.");
+    return;
+  }
+  if (!carregar(posicao)) {
+    resultado = "Posicao ausente, ilegivel ou invalida. Grave-a primeiro com o firmware principal. Nenhuma emissao.";
+  } else {
+    if (gpioRX != rx || gpioTX != tx) {
+      IrReceiver.stop();
+      pinMode(gpioRX, INPUT);
+      if (gpioTX != tx) pinMode(gpioTX, INPUT);
+      gpioRX = rx;
+      gpioTX = tx;
+      IrReceiver.begin(gpioRX, DISABLE_LED_FEEDBACK);
+      IrSender.begin(gpioTX);
+    }
+    emitir = modo == "emitir";
+    ocupado = true;
+    iniciado = false;
+    inicio = millis();
+    resultado = "Posicao " + String(posicao) + ", RX " + String(gpioRX) + ", TX " + String(gpioTX) + ".\n";
+    resultado += emitir ? "Preparando emissao unica..." : "Preparando escuta. Aperte o controle quando aparecer ESCUTANDO.";
+  }
+  servidor.sendHeader("Location", "/", true);
+  servidor.send(303, "text/plain", "");
+}
+
+void comparar() {
+  size_t quantidade = IrReceiver.irparams.rawlen > 0 ? IrReceiver.irparams.rawlen - 1 : 0;
+  if ((IrReceiver.decodedIRData.flags & IRDATA_FLAGS_WAS_OVERFLOW) || quantidade > MAX_TEMPOS) {
+    resultado += "\nESTOURO DO BUFFER: captura incompleta.";
+  } else {
+    for (size_t i = 0; i < quantidade; i++) {
+      int32_t tempo = int32_t(IrReceiver.irparams.rawbuf[i + 1]) * MICROS_PER_TICK;
+      recebido[i] = tempo + ((i & 1) ? MARK_EXCESS_MICROS : -MARK_EXCESS_MICROS);
+    }
+    size_t limite = min(quantidade, quantidadeEsperada);
+    size_t diferentes = 0;
+    int32_t maiorErro = 0;
+    for (size_t i = 0; i < limite; i++) {
+      int32_t erro = abs(recebido[i] - int32_t(esperado[i]));
+      int32_t tolerancia = max(int32_t(150), int32_t(esperado[i]) / 4);
+      if (erro > tolerancia || recebido[i] <= 0) diferentes++;
+      maiorErro = max(maiorErro, erro);
+    }
+    bool compativel = quantidade == quantidadeEsperada && diferentes == 0;
+    resultado += compativel ? "\nPULSOS COMPATIVEIS (comparacao aproximada)." : "\nPULSOS DIFERENTES OU CAPTURA INCOMPLETA.";
+    resultado += "\nEsperados: " + String(quantidadeEsperada) + "; recebidos: " + String(quantidade);
+    resultado += "\nPulsos fora da tolerancia: " + String(diferentes);
+    resultado += "\nMaior diferenca: " + String(maiorErro) + " us";
+    resultado += "\nEsperado (us): ";
+    for (size_t i = 0; i < quantidadeEsperada; i++) {
+      if (i) resultado += ",";
+      resultado += String(esperado[i]);
+    }
+    resultado += "\nRecebido compensado (us): ";
+    for (size_t i = 0; i < quantidade; i++) {
+      if (i) resultado += ",";
+      resultado += String(recebido[i]);
+    }
+  }
+  ocupado = false;
+  IrReceiver.resume();
+}
+
+void setup() {
+  uint8_t mac[6];
+  if (esp_read_mac(mac, ESP_MAC_WIFI_STA) != ESP_OK) return;
+  char texto[18];
+  snprintf(texto, sizeof(texto), "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  nomeAP = texto;
+  IrReceiver.begin(gpioRX, DISABLE_LED_FEEDBACK);
+  IrSender.begin(gpioTX);
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);
+  esp_wifi_set_protocol(WIFI_IF_AP, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+  esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
+  IPAddress ip(192, 168, 4, 1);
+  if (!WiFi.softAPConfig(ip, ip, IPAddress(255, 255, 255, 0))) return;
+  servidor.on("/", HTTP_GET, []() { servidor.send(200, "text/html; charset=utf-8", pagina()); });
+  servidor.on("/teste", HTTP_POST, testar);
+  servidor.on("/estado", HTTP_GET, []() {
+    servidor.sendHeader("Cache-Control", "no-store");
+    servidor.send(200, "text/plain; charset=utf-8", String(ocupado ? "1\n" : "0\n") + resultado);
+  });
+  servidor.onNotFound([]() {
+    servidor.sendHeader("Location", "http://192.168.4.1/", true);
+    servidor.send(302, "text/plain", "");
+  });
+  servidor.begin();
+  if (!WiFi.softAP(nomeAP.c_str())) return;
+  if (!dns.start(53, "*", ip)) return;
+  pronto = true;
+}
+
+void loop() {
+  if (!pronto) {
+    delay(10);
+    return;
+  }
+  dns.processNextRequest();
+  servidor.handleClient();
+  if (ocupado && !iniciado && millis() - inicio >= 500) {
+    IrReceiver.resume();
+    iniciado = true;
+    resultado += emitir ? "\nEmitindo com receptor ativo..." : "\nESCUTANDO: aperte uma vez o mesmo botao do controle.";
+    if (emitir) IrSender.sendRaw(esperado, quantidadeEsperada, 38);
+    inicio = millis();
+  }
+  if (ocupado && iniciado) {
+    if (IrReceiver.decode()) comparar();
+    else if (millis() - inicio >= (emitir ? 1500U : 10000U)) {
+      resultado += "\nSEM QUADRO IR CAPTURADO. Nao comprova ausencia de luz; verifique alinhamento, ligacao e alimentacao.";
+      ocupado = false;
+      IrReceiver.resume();
+    }
+  } else if (!ocupado && IrReceiver.decode()) IrReceiver.resume();
+  delay(1);
+}
