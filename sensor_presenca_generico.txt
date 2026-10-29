@@ -1,4 +1,4 @@
-#include <WiFi.h>
+﻿#include <WiFi.h>
 #include <Preferences.h>
 #include <WebServer.h>
 #include <DNSServer.h>
@@ -237,6 +237,9 @@ bool trocaArmada = false;
 WebServer servidorRecuperacao(80);
 DNSServer dnsRecuperacao;
 bool apRecuperacao = false;
+uint32_t inicioAP = 0;
+const uint32_t BUSCA_MS = 300000;
+const uint32_t AP_MS = 180000;
 
 bool estadoAnterior = false;
 
@@ -415,7 +418,7 @@ void atenderRadio() {
     enviarControle(pareado ? PRESENCA : ANUNCIO, canalAtual(), configuracao.revisao,
                    pareado ? receptorMAC : BROADCAST);
   }
-  if (pareado && millis() - ultimoContato >= 60000) {
+  if (pareado && millis() - ultimoContato >= BUSCA_MS) {
     iniciarAPRecuperacao();
     return;
   }
@@ -482,6 +485,7 @@ void iniciarAPRecuperacao() {
     return;
   }
   apRecuperacao = true;
+  inicioAP = millis();
 }
 
 void setup() {
@@ -511,12 +515,13 @@ void loop() {
     return;
   }
   if (apRecuperacao) {
+    if (millis() - inicioAP >= AP_MS) ESP.restart();
     dnsRecuperacao.processNextRequest();
     servidorRecuperacao.handleClient();
     delay(2);
     return;
   }
-  if (pareado && millis() - ultimoContato >= 60000) {
+  if (pareado && millis() - ultimoContato >= BUSCA_MS) {
     iniciarAPRecuperacao();
     return;
   }

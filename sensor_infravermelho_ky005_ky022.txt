@@ -1,11 +1,7 @@
-#include <WiFi.h>
+﻿#include <WiFi.h>
 #include <Preferences.h>
 #include <WebServer.h>
 #include <DNSServer.h>
-#define RAW_BUFFER_LENGTH 300
-#define NO_LED_FEEDBACK_CODE
-#define SEND_PWM_BY_TIMER
-#include <IRremote.hpp>
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <esp_system.h>
@@ -227,6 +223,7 @@ uint8_t receptorMAC[6] = {};
 uint32_t sessao = 0;
 bool pareado = false;
 bool ligadoAoReceptor = false;
+bool enviarInicial = true;
 uint8_t canalSalvo = 1;
 uint8_t canalBusca = 1;
 uint32_t ultimoContato = 0;
@@ -240,23 +237,19 @@ bool trocaArmada = false;
 WebServer servidorRecuperacao(80);
 DNSServer dnsRecuperacao;
 bool apRecuperacao = false;
+uint32_t inicioAP = 0;
+const uint32_t BUSCA_MS = 300000;
+const uint32_t AP_MS = 180000;
 
-const uint8_t MAX_CODIGOS_IR = 16;
-uint8_t posicaoGravacaoIR = 0;
-const size_t TAM_DADOS_DIRETOS = 250;
-const size_t MAX_TEMPOS_IR = RAW_BUFFER_LENGTH - 1;
-uint16_t temposIR[MAX_TEMPOS_IR] = {};
-
+bool estadoAnterior = false;
 
 ConfigDispositivo padraoDispositivo() {
   ConfigDispositivo c = {};
-  c.quantidadeGPIOs = 2;
-  c.recursos = RECURSO_COMANDO;
+  c.quantidadeGPIOs = 1;
+  c.recursos = 0;
   memset(c.pinos, 255, sizeof(c.pinos));
   c.pinos[0] = 4;
-  c.pinos[1] = 5;
-  strlcpy(c.rotulos[0], "IR RX", TAM_ROTULO);
-  strlcpy(c.rotulos[1], "IR TX", TAM_ROTULO);
+  strlcpy(c.rotulos[0], "GPIO", TAM_ROTULO);
   c.revisao = 1;
   strlcpy(c.nome, textoMAC(meuMAC).c_str(), sizeof(c.nome));
   return c;
@@ -264,9 +257,10 @@ ConfigDispositivo padraoDispositivo() {
 
 bool configuracaoLocalValida(const ConfigDispositivo& c) {
   if (!configuracaoValida(c) || !mesmaDescricao(c, padraoDispositivo())) return false;
-  if (c.pinos[0] >= GPIO_NUM_MAX || !GPIO_IS_VALID_GPIO(c.pinos[0])) return false;
-  if (c.pinos[1] >= GPIO_NUM_MAX || !GPIO_IS_VALID_OUTPUT_GPIO(c.pinos[1])) return false;
-  return c.pinos[0] != c.pinos[1];
+  for (int i = 0; i < c.quantidadeGPIOs; i++) {
+    if (c.pinos[i] >= GPIO_NUM_MAX || !GPIO_IS_VALID_GPIO(c.pinos[i])) return false;
+  }
+  return true;
 }
 
 bool salvarRegistro(const ConfigDispositivo& c, const uint8_t* receptor, uint8_t canal) {
@@ -304,153 +298,35 @@ void enviarControle(uint8_t tipo, uint8_t canal, uint32_t transacao, const uint8
   enviarBytes(destino, dados, sizeof(dados));
 }
 
-bool enviarMensagem(const String& valor) {
-  if (!pareado || !ligadoAoReceptor) return false;
-  String mensagem = "{\"" + textoMAC(meuMAC) + "\":" + valor + "}";
-  return mensagem.length() <= TAM_DADOS_DIRETOS &&
-    enviarBytes(receptorMAC, reinterpret_cast<const uint8_t*>(mensagem.c_str()), mensagem.length());
+void enviarMensagem(const String& valor) {
+  if (!pareado || !ligadoAoReceptor) return;
+  String mensagem = String("{\"") + textoMAC(meuMAC) + "\":" + valor + "}";
+  enviarBytes(receptorMAC, (const uint8_t*)mensagem.c_str(), mensagem.length());
 }
 
 void iniciarHardware() {
-  IrReceiver.begin(configuracao.pinos[0], DISABLE_LED_FEEDBACK);
-  IrSender.begin(configuracao.pinos[1]);
+  pinMode(configuracao.pinos[0], INPUT);
+  estadoAnterior = digitalRead(configuracao.pinos[0]) == HIGH;
 }
 
 void aplicarHardware(const ConfigDispositivo& anterior) {
-  if (anterior.pinos[0] == configuracao.pinos[0] &&
-      anterior.pinos[1] == configuracao.pinos[1]) return;
-  posicaoGravacaoIR = 0;
-  IrReceiver.stop();
-  pinMode(anterior.pinos[0], INPUT);
-  if (anterior.pinos[1] != configuracao.pinos[1]) {
-    digitalWrite(anterior.pinos[1], LOW);
-    pinMode(anterior.pinos[1], INPUT);
+  if (anterior.pinos[0] != configuracao.pinos[0]) {
+    pinMode(anterior.pinos[0], INPUT);
+    iniciarHardware();
   }
-  IrReceiver.begin(configuracao.pinos[0], DISABLE_LED_FEEDBACK);
-  IrSender.begin(configuracao.pinos[1]);
-}
-
-bool capturarTemposIR(size_t& quantidade) {
-  if (IrReceiver.irparams.rawlen <= 3) return false;
-  quantidade = IrReceiver.irparams.rawlen - 1;
-  if (quantidade > MAX_TEMPOS_IR) return false;
-  for (size_t i = 0; i < quantidade; i++) {
-    int32_t duracao = int32_t(IrReceiver.irparams.rawbuf[i + 1]) * MICROS_PER_TICK;
-    if ((i & 1) == 0) duracao -= MARK_EXCESS_MICROS;
-    else duracao += MARK_EXCESS_MICROS;
-    if (duracao <= 0 || duracao > UINT16_MAX) return false;
-    temposIR[i] = uint16_t(duracao);
-  }
-  return true;
-}
-
-bool salvarCodigoIR(uint8_t posicao, size_t quantidade) {
-  if (posicao == 0 || posicao > MAX_CODIGOS_IR ||
-      quantidade == 0 || quantidade > MAX_TEMPOS_IR) return false;
-  char chave[8];
-  snprintf(chave, sizeof(chave), "ir%u", unsigned(posicao));
-  if (!preferences.begin("neway", false)) return false;
-  size_t tamanho = quantidade * sizeof(uint16_t);
-  bool salvo = preferences.putBytes(chave, temposIR, tamanho) == tamanho;
-  uint16_t verificacao[MAX_TEMPOS_IR];
-  if (salvo) {
-    salvo = preferences.getBytesLength(chave) == tamanho &&
-      preferences.getBytes(chave, verificacao, tamanho) == tamanho &&
-      memcmp(temposIR, verificacao, tamanho) == 0;
-  }
-  preferences.end();
-  return salvo;
-}
-
-bool carregarCodigoIR(uint8_t posicao, size_t& quantidade) {
-  quantidade = 0;
-  if (posicao == 0 || posicao > MAX_CODIGOS_IR) return false;
-  char chave[8];
-  snprintf(chave, sizeof(chave), "ir%u", unsigned(posicao));
-  if (!preferences.begin("neway", true)) return false;
-  size_t tamanho = preferences.getBytesLength(chave);
-  bool valido = tamanho >= 3 * sizeof(uint16_t) &&
-    tamanho <= sizeof(temposIR) && tamanho % sizeof(uint16_t) == 0;
-  if (valido) valido = preferences.getBytes(chave, temposIR, tamanho) == tamanho;
-  preferences.end();
-  if (!valido) return false;
-  quantidade = tamanho / sizeof(uint16_t);
-  for (size_t i = 0; i < quantidade; i++) {
-    if (temposIR[i] == 0) return false;
-  }
-  return true;
-}
-
-void processarComandoIR(const uint8_t* dados, int tamanho) {
-  bool gravar = tamanho > 0 && dados[0] == '#';
-  int inicio = gravar ? 1 : 0;
-  int digitos = tamanho - inicio;
-  if (digitos < 1 || digitos > 2 || dados[inicio] < '1' || dados[inicio] > '9') {
-    enviarMensagem("\"ERRO_COMANDO_INVALIDO\"");
-    return;
-  }
-  uint8_t posicao = 0;
-  for (int i = inicio; i < tamanho; i++) {
-    if (dados[i] < '0' || dados[i] > '9') {
-      enviarMensagem("\"ERRO_COMANDO_INVALIDO\"");
-      return;
-    }
-    posicao = posicao * 10 + dados[i] - '0';
-  }
-  if (posicao > MAX_CODIGOS_IR) {
-    enviarMensagem("\"ERRO_POSICAO_INVALIDA\"");
-    return;
-  }
-  if (gravar) {
-    posicaoGravacaoIR = posicao;
-    IrReceiver.resume();
-    enviarMensagem("\"GRAVANDO\"");
-    return;
-  }
-  posicaoGravacaoIR = 0;
-  size_t quantidade = 0;
-  if (!carregarCodigoIR(posicao, quantidade)) {
-    enviarMensagem("\"ERRO_CODIGO_NAO_GRAVADO\"");
-    return;
-  }
-  IrReceiver.stop();
-  IrSender.sendRaw(temposIR, quantidade, 38);
-  IrReceiver.start();
-  enviarMensagem("\"TRANSMITIDO\"");
 }
 
 void atenderHardware() {
-  if (!IrReceiver.decode()) return;
-  if (posicaoGravacaoIR == 0) {
-    IrReceiver.resume();
-    return;
+  bool estado = digitalRead(configuracao.pinos[0]) == HIGH;
+  if (ligadoAoReceptor && (enviarInicial || estado != estadoAnterior)) {
+    enviarMensagem(estado ? "1" : "0");
+    enviarInicial = false;
   }
-  if ((IrReceiver.decodedIRData.flags & IRDATA_FLAGS_WAS_OVERFLOW) ||
-      IrReceiver.irparams.rawlen > MAX_TEMPOS_IR + 1) {
-    IrReceiver.resume();
-    enviarMensagem("\"ERRO_CODIGO_MUITO_LONGO\"");
-    return;
-  }
-  if ((IrReceiver.decodedIRData.flags & IRDATA_FLAGS_IS_REPEAT) || IrReceiver.irparams.rawlen <= 3) {
-    IrReceiver.resume();
-    return;
-  }
-  size_t quantidade = 0;
-  bool capturado = capturarTemposIR(quantidade);
-  IrReceiver.resume();
-  if (!capturado) {
-    enviarMensagem("\"ERRO_CAPTURA_IR\"");
-    return;
-  }
-  if (!salvarCodigoIR(posicaoGravacaoIR, quantidade)) {
-    enviarMensagem("\"ERRO_GRAVACAO\"");
-    return;
-  }
-  posicaoGravacaoIR = 0;
-  enviarMensagem("\"GRAVADO\"");
+  estadoAnterior = estado;
 }
 
 void confirmarContato() {
+  if (!ligadoAoReceptor) enviarInicial = true;
   ligadoAoReceptor = true;
   ultimoContato = millis();
   canalBusca = canalAtual();
@@ -460,13 +336,6 @@ void confirmarContato() {
 }
 
 void processarPacote(const Pacote& p) {
-  if (pareado && memcmp(p.origem, receptorMAC, 6) == 0 &&
-      memcmp(p.destino, meuMAC, 6) == 0 && p.tamanho > 0 &&
-      !(p.tamanho >= 4 && memcmp(p.dados, "NWAY", 4) == 0)) {
-    confirmarContato();
-    processarComandoIR(p.dados, p.tamanho);
-    return;
-  }
   if (!controleValido(p) ||
       memcmp(p.destino, meuMAC, 6) != 0 || memcmp(p.dados + 8, meuMAC, 6) != 0 ||
       ler32(p.dados + 14) != sessao) return;
@@ -495,6 +364,7 @@ void processarPacote(const Pacote& p) {
     if (mudou) {
       canalSalvo = canalAtual();
       aplicarHardware(anterior);
+      enviarInicial = true;
     }
     confirmarContato();
     enviarControle(CONFIG_OK, canalAtual(), configuracao.revisao, receptorMAC);
@@ -548,11 +418,14 @@ void atenderRadio() {
     enviarControle(pareado ? PRESENCA : ANUNCIO, canalAtual(), configuracao.revisao,
                    pareado ? receptorMAC : BROADCAST);
   }
+  if (pareado && millis() - ultimoContato >= BUSCA_MS) {
+    iniciarAPRecuperacao();
+    return;
+  }
 }
 
-
 String paginaRecuperacao() {
-  return "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>RESET</title><style>body{margin:0;background:#F2EAD8;color:#171512;font:16px ui-monospace,Consolas,'Courier New',monospace;padding:20px}.card{max-width:520px;margin:40px auto;padding:20px;border:1px solid #171512}button{width:100%;padding:12px;background:#F2EAD8;color:#171512;border:3px double #171512;font:inherit;font-size:18px;font-weight:bold}</style></head><body><main class='card'><h1>" + String(configuracao.nome) + "</h1><p>Hub não encontrado.</p><form action='/reset' method='post'><button type='submit'>RESET</button></form></main></body></html>";
+  return "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>RESET</title><style>*{box-sizing:border-box}body{margin:0;background:#F2EAD8;color:#171512;font-family:ui-monospace,Consolas,'Courier New',monospace;font-size:clamp(12px,3.5vw,16px);padding:5vw;display:flex;justify-content:center;align-items:flex-start;min-height:100vh}.card{max-width:320px;width:100%;text-align:center;padding:clamp(12px,4vw,20px);border:2px solid #171512;margin-top:8vh}button{width:100%;padding:clamp(10px,3vw,14px);background:#F2EAD8;color:#171512;border:3px double #171512;font:inherit;font-size:clamp(14px,4.5vw,18px);cursor:pointer;font-weight:normal}button:active{opacity:0.85}</style></head><body><main class='card'><form action='/reset' method='post'><button type='submit'>[ Reset ]</button></form></main></body></html>";
 }
 
 void executarResetWeb() {
@@ -565,7 +438,7 @@ void executarResetWeb() {
     servidorRecuperacao.send(500, "text/html; charset=utf-8", paginaRecuperacao());
     return;
   }
-  servidorRecuperacao.send(200, "text/html; charset=utf-8", "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><style>body{margin:0;background:#F2EAD8;color:#171512;font:16px ui-monospace,Consolas,'Courier New',monospace;padding:20px}.card{max-width:520px;margin:40px auto;padding:20px;border:1px solid #171512}</style></head><body><main class='card'><h1>Reiniciando...</h1></main></body></html>");
+  servidorRecuperacao.send(200, "text/html; charset=utf-8", "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>RESET</title><style>body{margin:0;background:#F2EAD8;color:#171512;font:14px ui-monospace,Consolas,'Courier New',monospace;padding:20px;display:flex;align-items:center;justify-content:center;min-height:100vh}.card{max-width:400px;width:90%;text-align:center;padding:20px;border:2px solid #171512}h1{margin:0;font-weight:normal}</style></head><body><main class='card'><h1>Reiniciando...</h1></main></body></html>");
   delay(500);
   ESP.restart();
 }
@@ -595,7 +468,7 @@ void iniciarAPRecuperacao() {
     servidorRecuperacao.send(302, "text/plain", "");
   });
   servidorRecuperacao.begin();
-  if (!WiFi.softAP(configuracao.nome, nullptr, canalAtual(), false, 4)) {
+  if (!WiFi.softAP(textoMAC(meuMAC).c_str(), nullptr, canalAtual(), false, 4)) {
     servidorRecuperacao.stop();
     delay(500);
     ESP.restart();
@@ -612,6 +485,7 @@ void iniciarAPRecuperacao() {
     return;
   }
   apRecuperacao = true;
+  inicioAP = millis();
 }
 
 void setup() {
@@ -641,12 +515,13 @@ void loop() {
     return;
   }
   if (apRecuperacao) {
+    if (millis() - inicioAP >= AP_MS) ESP.restart();
     dnsRecuperacao.processNextRequest();
     servidorRecuperacao.handleClient();
     delay(2);
     return;
   }
-  if (pareado && millis() - ultimoContato >= 60000) {
+  if (pareado && millis() - ultimoContato >= BUSCA_MS) {
     iniciarAPRecuperacao();
     return;
   }
@@ -654,3 +529,4 @@ void loop() {
   atenderHardware();
   delay(5);
 }
+
